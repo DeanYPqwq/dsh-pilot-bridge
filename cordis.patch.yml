@@ -1,0 +1,9 @@
+# dsh-pilot-bridge bundle layer.
+#
+# Registers the bridge as a plugin the Host loads. The name must be the specifier
+# exactly as it appears in the profile's node_modules, quoted so YAML does not
+# read it as a directive.
+- insert:
+    - id: dsh-pilot-bridge
+      name: "dsh-pilot-bridge"
+      config: {}

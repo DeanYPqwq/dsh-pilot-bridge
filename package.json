@@ -1,0 +1,13 @@
+{
+  "name": "dsh-pilot-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "description": "Approval and question bridge for DSH Pilot: forwards harness interactions to an iPhone over an authenticated WebSocket.",
+  "license": "MIT",
+  "files": ["index.js", "cordis.patch.yml"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  },
+  "exports": { ".": "./index.js" }
+}
