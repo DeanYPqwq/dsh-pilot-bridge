@@ -537,7 +537,8 @@ async function applyInner(ctx) {
                 };
                 questions.set(requestId, payload);
                 awaitingQuestions.set(requestId, { questionId: mapped[0].id, resolve: null });
-                log(`question ${requestId} asked (${mapped.length})`);
+                log(`question ${requestId} asked (${mapped.length}) session=${payload.sessionId} conns=${connections.size}`);
+                log(`question payload: ${JSON.stringify(payload).slice(0, 400)}`);
                 broadcast("s2c.pending.question", payload);
               }
             } catch (error) {
@@ -557,6 +558,16 @@ async function applyInner(ctx) {
             questions.delete(requestId);
             log(`question ${requestId} cleared`);
             broadcast("s2c.pending.cleared", { requestId });
+          } else if (data?.message?.isError === false || true) {
+            // callId 对不上时的兜底：任何一次 ask_user_question 的结果都意味着
+            // 最早那条待答提问已经结束。
+            const oldest = questions.keys().next().value;
+            if (oldest !== undefined) {
+              questions.delete(oldest);
+              awaitingQuestions.delete(oldest);
+              log(`question ${oldest} cleared (fallback)`);
+              broadcast("s2c.pending.cleared", { requestId: oldest });
+            }
           }
         }
 
@@ -638,20 +649,19 @@ async function applyInner(ctx) {
         // 电脑端卡片就已经弹出来了，而手机回答后那个回答者的 promise 永远没人
         // 兑现 —— 卡片就挂在那里不消失。现在只有手机不在时电脑端才会看到请求；
         // 手机在但一直不回答，超时后再交给电脑。
-        const TIMEOUT = Symbol("timeout");
+        // 电脑与手机**同时**看到卡片，任何一方回答都算数，并且没有超时。
+        const desktop = Promise.resolve().then(() => next());
         const phone = new Promise((resolve) => {
-          const timer = setTimeout(() => resolve(TIMEOUT), 20_000);
-          entry.resolve = (value) => { clearTimeout(timer); resolve(value); };
-          req?.signal?.addEventListener("abort", () => resolve(TIMEOUT), { once: true });
+          entry.resolve = (value) => resolve(value);
         });
-        const decision = await phone;
-        if (decision === TIMEOUT) {
-          log(`approval ${target}: no answer from phone in 20s, handing back to the host`);
+        const winner = await Promise.race([phone, desktop.then((v) => ({ fromDesktop: v }))]);
+        if (typeof winner === "object" && winner !== null && "fromDesktop" in winner) {
+          log(`approval ${target}: answered on the computer`);
           entry.resolve = null;
-          return next();
+          return winner.fromDesktop;
         }
-        log(`approval ${target} answered from phone: ${decision}`);
-        return decision;
+        log(`approval ${target} answered from phone: ${String(winner)}`);
+        return winner;
       },
       { global: true, prepend: true }
     ));
@@ -692,21 +702,27 @@ async function applyInner(ctx) {
           return next();
         }
         // 同审批：手机连着就由手机独占，避免电脑端卡片残留。
-        const TIMEOUT = Symbol("timeout");
-        const answer = await new Promise((resolve) => {
+        const desktop = Promise.resolve().then(() => next());
+        const phone = new Promise((resolve) => {
           const entry = awaitingQuestions.get(match);
-          const timer = setTimeout(() => resolve(TIMEOUT), 20_000);
-          entry.resolve = (value) => { clearTimeout(timer); resolve(value); };
-          request?.signal?.addEventListener("abort", () => resolve(TIMEOUT), { once: true });
+          entry.resolve = (value) => resolve(value);
         });
-        if (answer === TIMEOUT) {
-          log(`question ${match}: no answer from phone in 20s, handing back`);
+        const winner = await Promise.race([phone, desktop.then((v) => ({ fromDesktop: v }))]);
+        const finishQuestion = () => {
           awaitingQuestions.delete(match);
-          return next();
+          if (questions.delete(match)) {
+            log(`question ${match} cleared`);
+            broadcast("s2c.pending.cleared", { requestId: match });
+          }
+        };
+        if (typeof winner === "object" && winner !== null && "fromDesktop" in winner) {
+          log(`question ${match}: answered on the computer`);
+          finishQuestion();
+          return winner.fromDesktop;
         }
         log(`question ${match} answered from phone`);
-        awaitingQuestions.delete(match);
-        return { answers: answer };
+        finishQuestion();
+        return { answers: winner };;
       },
       { global: true, prepend: true }
     ));
