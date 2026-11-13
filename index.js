@@ -15,7 +15,8 @@
  * handshake, `s2c.welcome`, ping, and the approval frames.
  */
 
-import { createHash, createPublicKey, randomBytes, verify as cryptoVerify } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, randomBytes, sign as cryptoSign, verify as cryptoVerify } from "node:crypto";
+import { connect as http2Connect } from "node:http2";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os, { homedir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +56,101 @@ const PAGE_PORT = 3103;
 // bound — which is exactly how the port ended up stuck.
 const SERVER_SLOT = "__dshPilotBridgeServer";
 const LISTENERS_SLOT = "__dshPilotBridgeListeners";
+
+// --- APNs ---------------------------------------------------------------------
+//
+// 用 token 认证（.p8 + Key ID + Team ID）而不用证书：一个密钥覆盖全部 App，
+// 且不会像证书那样一年过期。JWT 缓存 50 分钟，Apple 只接受 1 小时内的。
+const APNS_KEY_PATH = process.env.PILOT_APNS_KEY
+  ?? `${homedir()}/Documents/keys/AuthKey_BQ6Z7897DJ.p8`;
+const APNS_KEY_ID = process.env.PILOT_APNS_KEY_ID ?? "BQ6Z7897DJ";
+const APNS_TEAM_ID = process.env.PILOT_APNS_TEAM_ID ?? "7PG83J22AP";
+const APNS_TOPIC = process.env.PILOT_APNS_TOPIC ?? "com.dshpilot.app";
+// 当前装的是 Debug 构建（aps-environment=development），它的 device token
+// 只能推到沙盒网关。
+const APNS_HOST = (process.env.PILOT_APNS_ENV ?? "sandbox") === "production"
+  ? "api.push.apple.com"
+  : "api.sandbox.push.apple.com";
+
+let jwtCache = { value: "", refreshAt: 0 };
+
+/** 生成（或复用）APNs 需要的 ES256 JWT。 */
+function apnsJWT() {
+  const now = Math.floor(Date.now() / 1000);
+  if (jwtCache.value && jwtCache.refreshAt > now) return jwtCache.value;
+  const header = Buffer.from(JSON.stringify({ alg: "ES256", kid: APNS_KEY_ID })).toString("base64url");
+  const claims = Buffer.from(JSON.stringify({ iss: APNS_TEAM_ID, iat: now })).toString("base64url");
+  const input = `${header}.${claims}`;
+  const key = createPrivateKey(readFileSync(APNS_KEY_PATH, "utf8"));
+  // ieee-p1363 输出裸 R||S，正是 JWS 对 ES256 的要求（DER 会被 Apple 拒绝）。
+  const signature = cryptoSign("sha256", Buffer.from(input), { key, dsaEncoding: "ieee-p1363" })
+    .toString("base64url");
+  jwtCache = { value: `${input}.${signature}`, refreshAt: now + 3000 };
+  return jwtCache.value;
+}
+
+/** 向一个 device token 推送一条通知。 */
+function sendPush(token, payload) {
+  return new Promise((resolve) => {
+    let client;
+    try {
+      client = http2Connect(`https://${APNS_HOST}`);
+    } catch (error) {
+      log(`apns connect failed: ${error?.message ?? error}`);
+      return resolve(false);
+    }
+    let settled = false;
+    const done = (ok, note) => {
+      if (settled) return;
+      settled = true;
+      try { client.close(); } catch {}
+      if (note) log(note);
+      resolve(ok);
+    };
+    client.on("error", (error) => done(false, `apns error: ${error?.message ?? error}`));
+
+    const request = client.request({
+      ":method": "POST",
+      ":path": `/3/device/${token}`,
+      authorization: `bearer ${apnsJWT()}`,
+      "apns-topic": APNS_TOPIC,
+      "apns-push-type": "alert",
+      "apns-priority": "10",
+      "apns-expiration": "0",
+    });
+    let status = 0;
+    let body = "";
+    request.on("response", (headers) => { status = Number(headers[":status"] ?? 0); });
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => done(status === 200, `apns ${status}${body ? " " + body.slice(0, 120) : ""}`));
+    request.on("error", (error) => done(false, `apns request error: ${error?.message ?? error}`));
+    request.end(JSON.stringify(payload));
+  });
+}
+
+/** 给所有登记过 token 的设备发一条通知。 */
+function pushToDevices(deviceMap, title, body, extra) {
+  let sent = 0;
+  for (const record of Object.values(deviceMap)) {
+    const token = record?.pushToken;
+    if (!token) continue;
+    sent += 1;
+    void sendPush(token, {
+      aps: {
+        alert: { title, body },
+        sound: "default",
+        "interruption-level": "time-sensitive",
+      },
+      ...extra,
+    });
+  }
+  const total = Object.keys(deviceMap).length;
+  const withToken = Object.values(deviceMap).filter((r) => r?.pushToken).length;
+  log(`push attempt: ${sent} target(s), devices=${total}, withToken=${withToken}`);
+  if (sent > 0) log(`push queued for ${sent} device(s): ${title}`);
+  return sent;
+}
 
 /** 记录一个 disposer，供下次重载统一释放。 */
 function track(dispose) {
@@ -422,6 +518,24 @@ async function applyInner(ctx) {
 
   const devices = readJSON(DEVICES_PATH, {});
   const connections = new Map();
+
+  /// 真正可用的连接数。
+  ///
+  /// `connections` 里的记录要等 `close` 才移除，而 iOS 被强杀后 socket 可能长期
+  /// 停在 ESTABLISHED —— 只数 Map 会把"App 已经没了"误判成"手机在线"，推送就
+  /// 永远发不出去。所以还要求最近 90 秒内收到过帧。
+  const liveConnectionCount = () => {
+    let live = 0;
+    for (const [deviceId, set] of connections) {
+      for (const connection of set) {
+        const fresh = Date.now() - (connection.lastSeen ?? 0) < 90_000;
+        if (connection?.socket?.readyState === 1 && fresh) live += 1;
+        else if (connection?.socket?.readyState !== 1) set.delete(connection);
+      }
+      if (set.size === 0) connections.delete(deviceId);
+    }
+    return live;
+  };
   const approvals = new Map();
   /** requestId -> { requestId, sessionId, questions[] } — 来自 ask_user_question 工具调用。 */
   const questions = new Map();
@@ -540,6 +654,13 @@ async function applyInner(ctx) {
                 log(`question ${requestId} asked (${mapped.length}) session=${payload.sessionId} conns=${connections.size}`);
                 log(`question payload: ${JSON.stringify(payload).slice(0, 400)}`);
                 broadcast("s2c.pending.question", payload);
+                if (liveConnectionCount() === 0) {
+                  pushToDevices(devices, "DSH 向你提问", String(mapped[0]?.question ?? "等待你回答"), {
+                    kind: "question",
+                    requestId,
+                    sessionId: payload.sessionId,
+                  });
+                }
               }
             } catch (error) {
               log(`question parse failed: ${error?.message ?? error}`);
@@ -590,6 +711,14 @@ async function applyInner(ctx) {
           });
           log(`approval ${payload.requestId} asked (${payload.toolName})`);
           broadcast("s2c.pending.approval", payload);
+          // 手机不在线（App 被挂起或没开）时用系统推送叫醒它。
+          if (liveConnectionCount() === 0) {
+            pushToDevices(devices, "DSH 请求审批", `${payload.toolName}：${payload.summary || "等待你决定"}`, {
+              kind: "approval",
+              requestId: payload.requestId,
+              sessionId: payload.sessionId,
+            });
+          }
         } else if (type === "approval/decided") {
           const requestId = String(event?.data?.id ?? "");
           if (!requestId || !approvals.has(requestId)) return;
@@ -837,6 +966,8 @@ async function applyInner(ctx) {
     log("socket opened; challenge sent");
 
     ws.on("message", (raw) => {
+      // 任何一帧都算"还活着"，供 liveConnectionCount 判断。
+      connection.lastSeen = Date.now();
       let frame;
       try {
         frame = JSON.parse(String(raw));
@@ -935,6 +1066,19 @@ async function applyInner(ctx) {
         case "c2s.ping":
           connection.send("s2c.pong", {});
           break;
+        case "c2s.push.register": {
+          const token = String(payload.token ?? "");
+          if (token.length >= 64 && connection.deviceId && devices[connection.deviceId]) {
+            devices[connection.deviceId].pushToken = token;
+            devices[connection.deviceId].pushEnvironment = APNS_HOST;
+            writeJSON(DEVICES_PATH, devices);
+            log(`push token registered for ${connection.deviceId.slice(0, 8)} (${token.length} chars)`);
+          } else if (token.length > 0) {
+            log(`push token rejected: len=${token.length} device=${connection.deviceId ? "yes" : "no"}`);
+          }
+          connection.send("s2c.ack", {}, frame.id);
+          break;
+        }
         case "c2s.pending.list":
           connection.send(
             "s2c.pending.snapshot",
