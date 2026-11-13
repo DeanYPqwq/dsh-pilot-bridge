@@ -214,6 +214,39 @@ http://127.0.0.1:3103/pair
 
 ---
 
+## 远程推送（APNs）
+
+App 在后台或被系统挂起时，socket 已经断开，卡片无法送达。此时桥接会改用系统推送。
+
+**触发条件**：审批或提问发起时，桥接判定手机**不在线**（没有活跃的已认证连接，
+或连接超过 90 秒没有任何帧）。App 在前台时不发推送 —— 避免同一件事既弹卡片又弹通知。
+
+**配置**（三样缺一不可）：
+
+| 项目 | 说明 |
+|---|---|
+| `.p8` 私钥 | 在 Apple Developer → Keys 创建，勾选 *Apple Push Notifications service (APNs)* |
+| Key ID | `.p8` 文件名里的 10 位，例如 `BQ6Z7897DJ` |
+| Team ID | 开发者账号的 Team ID |
+
+默认从 `~/Documents/keys/AuthKey_<KeyID>.p8` 读取，可用环境变量覆盖：
+
+| 环境变量 | 默认值 |
+|---|---|
+| `PILOT_APNS_KEY` | `~/Documents/keys/AuthKey_BQ6Z7897DJ.p8` |
+| `PILOT_APNS_KEY_ID` | `BQ6Z7897DJ` |
+| `PILOT_APNS_TEAM_ID` | `7PG83J22AP` |
+| `PILOT_APNS_TOPIC` | `com.dshpilot.app` |
+| `PILOT_APNS_ENV` | `sandbox`（Debug 构建）；上架版本改为 `production` |
+
+> JWT 用 ES256 签名，缓存 50 分钟。签名必须是 `ieee-p1363`（裸 R‖S），
+> 用 DER 编码会被 Apple 拒绝。
+
+**设备 token**：App 连上桥接后通过 `c2s.push.register` 上报，桥接持久化到
+`~/.dsh/pilot-bridge/devices.json`。
+
+---
+
 ## 端口
 
 | 端口 | 用途 | 监听范围 |
@@ -278,6 +311,8 @@ printf '\n# reload %s\n' "$(date +%s)" >> ~/.dsh/profiles/desktop/cordis.patch.y
 - **不支持公网**：依赖局域网直连，公网需要额外的证书与安全加固
 - **不转发对话**：对话走 `dsh-deeppilot`，本插件只处理审批与提问
 - **灵动岛暂不支持交互**：Live Activity 无法直接发起网络请求，需要额外设计
+- **推送环境区分**：Debug 构建的 token 只能推沙盒网关（`api.sandbox.push.apple.com`），
+  上架版本需另建 Production 密钥并改 `PILOT_APNS_ENV`
 - **需要 DSH 的 cordis 根上下文**：监听器必须注册在 `ctx.root` 上，详见源码注释
 
 ---
